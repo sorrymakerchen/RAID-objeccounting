@@ -1,0 +1,10 @@
+# Install the CUDA-compatible PyTorch wheels separately (see docs/FSC147_COUNTING.md).
+torch>=2.3,<2.7
+torchvision>=0.18,<0.22
+numpy>=1.24,<2
+Pillow>=9.1
+ftfy>=6.1
+regex
+tqdm
+packaging
+git+https://github.com/openai/CLIP.git

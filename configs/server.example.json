@@ -1,0 +1,17 @@
+{
+  "data_root": "/datasets/fsc147",
+  "text_annotations": "/datasets/FSC-147-D.json",
+  "projection_weights": "/models/vitb_mlp_infonce.pth",
+  "dino_repo": "/code/dinov2",
+  "dino_weights": "/models/dinov2_vitb14_reg4_pretrain.pth",
+  "clip_weights": "/models/ViT-B-16.pt",
+  "device": "cuda:0",
+  "workers": 4,
+  "batch_size": 2,
+  "accumulation": 4,
+  "epochs": 100,
+  "limit_train": null,
+  "limit_val": null,
+  "augment": true,
+  "output_dir": "outputs/fsc147_text"
+}
