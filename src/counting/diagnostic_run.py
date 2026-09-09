@@ -110,10 +110,12 @@ def route_columns(routes):
         values = routes[key]
         for index in range(3):
             result[f'{key}_{index}'] = None if values is None else values[index]
-    for index, weight in enumerate(routes['stage1_weights']):
-        result[f'stage1_selected_{index}'] = int(weight > 0)
     for index in range(3):
-        result[f'stage2_dominant_{index}'] = int(index == int(np.argmax(routes['stage2_weights'])))
+        weights = routes['stage1_weights']
+        result[f'stage1_selected_{index}'] = None if weights is None else int(weights[index] > 0)
+    for index in range(3):
+        result[f'stage2_dominant_{index}'] = (None if routes['stage2_weights'] is None else
+                                            int(index == int(np.argmax(routes['stage2_weights']))))
     result['stage2_routing_active'] = routes['stage2_routing_active']
     return result
 

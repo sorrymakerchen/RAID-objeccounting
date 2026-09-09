@@ -60,6 +60,7 @@ def parse_config(mode, argv=None):
         parser.add_argument('--text', required=True)
     args = vars(parser.parse_args(argv))
     defaults = read_json(DEFAULT_CONFIG)
+    defaults.update(head_type='raid', local_count_weight=0., routing_seed=None)
     overrides = read_json(args['config']) if args['config'] else {}
     unknown = set(overrides) - set(defaults)
     if unknown:
@@ -84,6 +85,8 @@ def parse_config(mode, argv=None):
         raise ValueError('image_size must be divisible by 14 and provide at least k patches')
     if config['count_loss_mode'] not in ('relative', 'absolute'):
         raise ValueError('count_loss_mode must be relative or absolute')
+    if config['head_type'] not in ('raid', 'spatial'):
+        raise ValueError('head_type must be raid or spatial')
     if config['density_supervision_size'] < 1 or (config['image_size'] // 14) % config['density_supervision_size']:
         raise ValueError('density_supervision_size must divide the native output grid')
     return config, args
@@ -97,7 +100,9 @@ def build_model(config):
                                        ('projection_weights', 'dino_repo', 'dino_weights',
                                         'clip_weights', 'download_root')})
     return RAIDCounter(encoder, reduced_dim=config['reduced_dim'], k=config['k'],
-                       expert_dim=config['expert_dim'], warmup_epochs=config['warmup_epochs']).to(device)
+                       expert_dim=config['expert_dim'], warmup_epochs=config['warmup_epochs'],
+                       head_type=config.get('head_type', 'raid'),
+                       routing_seed=config.get('routing_seed')).to(device)
 
 
 def build_loader(config, split, limit=None, training=False):
@@ -139,7 +144,8 @@ def train(config, args):
     for epoch in range(start, config['epochs']):
         training = train_epoch(model, train_loader, optimizer, config['device'], epoch,
                                config['accumulation'], count_loss_mode=config.get('count_loss_mode', 'relative'),
-                               density_supervision_size=config.get('density_supervision_size', 32))
+                               density_supervision_size=config.get('density_supervision_size', 32),
+                               local_count_weight=config.get('local_count_weight', 0.))
         validation, _ = evaluate(model, val_loader, config['device'], epoch)
         LOGGER.info('epoch=%d train=%s val=%s', epoch, training, validation)
         record = {'epoch': epoch, 'train': training, 'val': validation}

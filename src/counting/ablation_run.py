@@ -264,9 +264,11 @@ def gradient_probe(model, dataset, ids, config, epoch):
         output = model(batch['image'].to(config['device']), batch['text'], epoch, return_diagnostics=True)
         logits = output['diagnostics']['mixed_logits']
         loss = counting_loss(output, batch['density'].to(config['device']), batch['count'].to(config['device']),
-                             config['count_loss_mode'], 32)
-        gradients = [torch.autograd.grad(loss[key], logits, retain_graph=True)[0].detach()
-                     for key in ('density_loss', 'count_loss')]
+                             config['count_loss_mode'], 32, config.get('local_count_weight', 0.))
+        keys = ['density_loss', 'count_loss']
+        if config.get('local_count_weight', 0.):
+            keys.append('local_count_loss')
+        gradients = [torch.autograd.grad(loss[key], logits, retain_graph=True)[0].detach() for key in keys]
         if any(not torch.isfinite(gradient).all() for gradient in gradients):
             raise FloatingPointError(f'Non-finite probe gradient: {batch["image_id"]}')
         for index, name in enumerate(batch['image_id']):
@@ -274,16 +276,26 @@ def gradient_probe(model, dataset, ids, config, epoch):
                          'density_gradient_l2': float(gradients[0][index].norm()),
                          'count_gradient_l2': float(gradients[1][index].norm()),
                          'weighted_count_gradient_l2': float(.1 * gradients[1][index].norm())})
+            if len(gradients) == 3:
+                rows[-1]['local_gradient_l2'] = float(gradients[2][index].norm())
+                rows[-1]['weighted_local_gradient_l2'] = float(config['local_count_weight'] * gradients[2][index].norm())
         del output, logits, loss, gradients
     return rows
 
 
-def run_training(args, directory):
+def run_training(args, directory, config_factory=None, model_factory=None):
+    config_factory = config_factory or experiment_config
+    model_factory = model_factory or build_model
     base, _ = parse_config('train', ['--config', args.config, '--device', args.device])
-    config = experiment_config(base, args.group)
+    config = config_factory(base, args.group)
     config['output_dir'] = str(directory)
     provenance = prepared_provenance(config)
     provenance['reference_sha256'] = sha256(args.reference_csv)
+    if args.group.startswith('A'):
+        root = Path(__file__).resolve().parents[2]
+        for name in ('src/counting/structure_run.py', 'src/counting/cli.py',
+                     'src/counting/diagnostic_run.py', 'src/counting/diagnostics.py'):
+            provenance['source_sha256'][name] = sha256(root / name)
     reference = read_predictions(args.reference_csv)
     validation = dataset_for(config, 'val')
     classes = load_classes(Path(config['data_root']) / 'ImageClasses_FSC147.txt')
@@ -293,9 +305,11 @@ def run_training(args, directory):
     trainset = dataset_for(config, 'train', training=True)
     probeset = dataset_for(config, 'train')
     ids = probe_ids(probeset)
-    set_seed(42)
-    model = build_model(config)
+    set_seed(config['seed'])
+    model = model_factory(config)
     initial_digest = state_digest(model)
+    if args.group.startswith('A'):
+        provenance['shared_projection_sha256'] = state_digest(model.projection)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=1e-4)
     start, best = 0, float('inf')
     if args.resume:
@@ -331,7 +345,8 @@ def run_training(args, directory):
         started = time.perf_counter()
         training = train_epoch(model, loader_for(trainset, config, True, epoch), optimizer,
                                config['device'], epoch, 4, count_loss_mode=config['count_loss_mode'],
-                               density_supervision_size=32, collect_diagnostics=True)
+                               density_supervision_size=32, collect_diagnostics=True,
+                               local_count_weight=config.get('local_count_weight', 0.))
         if args.smoke:
             validation_loader = loader_for(Subset(validation, list(range(min(4, len(validation))))), config)
         else:
@@ -352,6 +367,14 @@ def run_training(args, directory):
                             metadata={'experiment_group': args.group,
                                       'experiment_smoke': args.smoke, 'experiment_profile': args.command == 'profile'})
     if args.smoke or args.command == 'profile':
+        if args.smoke:
+            batch = next(iter(validation_loader))
+            model.eval()
+            with torch.no_grad():
+                expected = model(batch['image'].to(config['device']), batch['text'], epoch)['density']
+                restore_checkpoint(directory / 'latest.pt', model, optimizer)
+                actual = model(batch['image'].to(config['device']), batch['text'], epoch)['density']
+            torch.testing.assert_close(expected, actual, rtol=0, atol=0)
         status = 'training_smoke_passed' if args.smoke else 'profile_complete_not_formal_training'
         write_json(directory / 'summary.json', {'status': status, 'epoch_seconds': epoch_times,
                    'recommended_time_minutes': None if args.smoke else math.ceil(max(epoch_times) * 100 * 1.3 / 60),
@@ -373,8 +396,20 @@ def run_training(args, directory):
     write_json(directory / 'summary.json', dict(status='complete', group=args.group, **scoring(rows),
                best_epoch=best_epoch, initial_state_sha256=initial_digest,
                training_peak_gpu_allocated_bytes=training_peak,
-               checkpoint_sha256=sha256(directory / 'best.pt'), **timing))
-    write_experiment_report(directory, [dict(experiment=args.group, **scoring(rows))], 'complete')
+               checkpoint_sha256=sha256(directory / 'best.pt'),
+               trainable_parameters=sum(p.numel() for p in model.parameters() if p.requires_grad),
+               total_parameters=sum(p.numel() for p in model.parameters()),
+               training_seconds=sum(json.loads(line)['seconds'] for line in
+                                    (directory / 'history.jsonl').read_text(encoding='utf-8').splitlines()), **timing))
+    if args.group.startswith('A'):
+        (directory / 'report.md').write_text(
+            f'# Structure experiment {args.group}\n\n'
+            f'Validation MAE: {scoring(rows)["mae"]:.4f}; RMSE: {scoring(rows)["rmse"]:.4f}.\n'
+            f'Best epoch (zero-based): {best_epoch}. Head: {config["head_type"]}.\n'
+            'Run structure_fsc147.py summarize for controlled selection and shared-range comparisons.\n'
+            'Validation only. Spatial head routing is not applicable. No SOTA or causal claim.\n', encoding='utf-8')
+    else:
+        write_experiment_report(directory, [dict(experiment=args.group, **scoring(rows))], 'complete')
     return 0
 
 

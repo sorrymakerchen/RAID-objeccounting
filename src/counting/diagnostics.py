@@ -243,10 +243,13 @@ def render_sample(image, points, target_grid, variants, directory):
             ImageDraw.Draw(panel).text((x + 5, y + 5), label, fill='black')
         routes = raw.get('routes', {})
         for stage in ('stage1_weights', 'stage2_weights'):
-            if stage in routes:
+            line = 0 if stage == 'stage1_weights' else 1
+            if routes.get(stage) is not None:
                 values = ', '.join(f'{v:.3f}' for v in routes[stage])
-                line = 0 if stage == 'stage1_weights' else 1
                 ImageDraw.Draw(panel).text((cell_w * 4 + 5, row * cell_h + cell_h - 38 + line * 15),
                                           f'{stage}: [{values}]', fill='black')
+            else:
+                ImageDraw.Draw(panel).text((cell_w * 4 + 5, row * cell_h + cell_h - 38 + line * 15),
+                                          f'{stage}: N/A', fill='black')
     panel.save(directory / 'comparison.png')
     return ranges

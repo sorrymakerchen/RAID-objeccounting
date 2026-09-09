@@ -60,10 +60,22 @@ class CountingRouter(nn.Module):
         nn.init.zeros_(self.conv.weight)
         nn.init.zeros_(self.conv.bias)
 
+    def set_noise_seed(self, seed):
+        # Persist the dedicated stream in checkpoints without changing legacy state keys.
+        self.register_buffer('noise_step', torch.zeros((), dtype=torch.long))
+        self.register_buffer('noise_seed', torch.tensor(seed, dtype=torch.long))
+
     def forward(self, x):
         scores = self.conv(x).mean((2, 3))
         if self.training:
-            scores = scores + torch.rand_like(scores) * 0.01
+            if hasattr(self, 'noise_step'):
+                generator = torch.Generator(device=scores.device)
+                generator.manual_seed(int(self.noise_seed) + int(self.noise_step))
+                noise = torch.rand(scores.shape, device=scores.device, generator=generator)
+                self.noise_step.add_(1)
+            else:
+                noise = torch.rand_like(scores)
+            scores = scores + noise * 0.01
         return scores.softmax(-1)
 
 
@@ -136,15 +148,42 @@ class CountingMoE(nn.Module):
         return logits, balance
 
 
+class SpatialCountingHead(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.input = nn.Conv2d(channels, 128, 1)
+        self.blocks = nn.ModuleList([nn.Sequential(
+            nn.Conv2d(128, 128, 3, padding=d, dilation=d), nn.GroupNorm(8, 128), nn.GELU(),
+            nn.Conv2d(128, 128, 3, padding=d, dilation=d), nn.GroupNorm(8, 128), nn.GELU())
+            for d in (1, 2, 4)])
+        self.output = nn.Conv2d(128, 1, 1)
+        nn.init.constant_(self.output.bias, -3.)
+
+    def forward(self, guidance, matching):
+        x = self.input(torch.cat([guidance, matching], dim=1))
+        for block in self.blocks:
+            x = x + block(x)
+        return self.output(x).flatten(1)
+
+
 class RAIDCounter(nn.Module):
     def __init__(self, encoder, feature_dim=768, reduced_dim=384, k=150,
-                 expert_dim=384, warmup_epochs=30):
+                 expert_dim=384, warmup_epochs=30, head_type='raid', routing_seed=None):
         super().__init__()
         self.encoder = encoder.requires_grad_(False).eval()
         self.retrieval = TextGuidedRetrieval(k)
         self.projection = nn.Conv2d(feature_dim, reduced_dim, 1)
-        self.moe = CountingMoE(reduced_dim * 2 + 1, expert_dim, k,
-                               warmup_epochs=warmup_epochs)
+        self.head_type = head_type
+        if head_type == 'raid':
+            self.moe = CountingMoE(reduced_dim * 2 + 1, expert_dim, k,
+                                   warmup_epochs=warmup_epochs)
+            if routing_seed is not None:
+                self.moe.router1.set_noise_seed(routing_seed)
+                self.moe.router2.set_noise_seed(routing_seed + 1000000)
+        elif head_type == 'spatial':
+            self.spatial_head = SpatialCountingHead(reduced_dim * 2 + 1 + k)
+        else:
+            raise ValueError(f'Unknown counting head: {head_type}')
 
     def train(self, mode=True):
         super().train(mode)
@@ -165,7 +204,16 @@ class RAIDCounter(nn.Module):
         guidance = torch.cat([self.projection(retrieved['query']),
                               self.projection(retrieved['reconstructed']),
                               retrieved['similarity']], dim=1)
-        moe_output = self.moe(guidance, retrieved['matching'], epoch, return_diagnostics, intervention)
+        if self.head_type == 'spatial':
+            if intervention != 'D0':
+                raise ValueError('Spatial head does not support legacy interventions')
+            logits = self.spatial_head(guidance, retrieved['matching'])
+            detail = {key: None for key in ('stage1_probabilities', 'stage1_weights',
+                                            'stage2_probabilities', 'stage2_weights')}
+            detail.update(stage2_routing_active=None, mixed_logits=logits)
+            moe_output = (logits, logits.new_zeros(()), detail)
+        else:
+            moe_output = self.moe(guidance, retrieved['matching'], epoch, return_diagnostics, intervention)
         logits, balance = moe_output[:2]
         density = F.softplus(logits).reshape(images.shape[0], 1, *features.shape[-2:])
         result = {'density': density, 'count': density.sum((1, 2, 3)),

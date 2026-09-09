@@ -37,7 +37,15 @@ def sum_pool_density(density, size):
                            size, width // size).sum((-1, -3))
 
 
-def counting_loss(output, target, count, count_loss_mode='relative', density_supervision_size=None):
+def local_count_loss(prediction, target):
+    if prediction.shape != target.shape or prediction.shape[-2:] != (32, 32):
+        raise ValueError('Local count supervision requires matching 32x32 densities')
+    return sum(((sum_pool_density(prediction, g) - sum_pool_density(target, g)).abs()
+                / (sum_pool_density(target, g) + 1)).mean() for g in (4, 8)) / 2
+
+
+def counting_loss(output, target, count, count_loss_mode='relative', density_supervision_size=None,
+                  local_count_weight=0.):
     if count_loss_mode not in ('relative', 'absolute'):
         raise ValueError(f'Unknown count loss mode: {count_loss_mode}')
     prediction = output['density']
@@ -49,14 +57,20 @@ def counting_loss(output, target, count, count_loss_mode='relative', density_sup
     error = (output['count'] - count).abs()
     count_loss = (error / (count + 1)).mean() if count_loss_mode == 'relative' else error.mean()
     loss = density_loss + 0.1 * count_loss + 0.005 * output['balance_loss']
+    if not np.isfinite(local_count_weight) or local_count_weight < 0:
+        raise ValueError('local_count_weight must be finite and nonnegative')
+    local_loss = local_count_loss(prediction, target) if local_count_weight else loss.new_zeros(())
+    if local_count_weight:
+        loss = loss + local_count_weight * local_loss
     if not torch.isfinite(loss):
         raise FloatingPointError('Counting loss is non-finite; inspect inputs, density and gradients')
     return {'loss': loss, 'density_loss': density_loss, 'count_loss': count_loss,
-            'balance_loss': output['balance_loss']}
+            'balance_loss': output['balance_loss'], 'local_count_loss': local_loss}
 
 
 def train_epoch(model, loader, optimizer, device, epoch, accumulation=4, log_every=20,
-                count_loss_mode='relative', density_supervision_size=None, collect_diagnostics=False):
+                count_loss_mode='relative', density_supervision_size=None, collect_diagnostics=False,
+                local_count_weight=0.):
     if accumulation < 1 or not len(loader):
         raise ValueError('Gradient accumulation and training loader length must be positive')
     model.train()
@@ -68,7 +82,7 @@ def train_epoch(model, loader, optimizer, device, epoch, accumulation=4, log_eve
             kwargs = {'return_diagnostics': True} if collect_diagnostics else {}
             output = model(batch['image'].to(device), batch['text'], epoch, **kwargs)
             losses = counting_loss(output, batch['density'].to(device), batch['count'].to(device),
-                                   count_loss_mode, density_supervision_size)
+                                   count_loss_mode, density_supervision_size, local_count_weight)
             group_start = (step // accumulation) * accumulation
             group_end = min(group_start + accumulation, len(loader))
             # Account for both the last accumulation group and a smaller final batch.
@@ -96,6 +110,8 @@ def train_epoch(model, loader, optimizer, device, epoch, accumulation=4, log_eve
                 detail = output['diagnostics']
                 for stage in ('stage1', 'stage2'):
                     weights = detail[stage + '_weights']
+                    if weights is None:
+                        continue
                     for index in range(weights.shape[1]):
                         for label, value in [('weight', weights[:, index].sum()),
                                              ('selected', (weights[:, index] > 0).sum())]:
