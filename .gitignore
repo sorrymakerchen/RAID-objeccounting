@@ -5,3 +5,6 @@ outputs/
 runtime/
 weights/
 checkpoints/
+*.rar
+log/*
+!log/.gitkeep

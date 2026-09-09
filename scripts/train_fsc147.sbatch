@@ -6,11 +6,11 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --output=slurm-%x-%j.out
-#SBATCH --error=slurm-%x-%j.err
+#SBATCH --output=log/slurm-%x-%j.out
+#SBATCH --error=log/slurm-%x-%j.err
 #SBATCH --export=ALL
 
-# Submit from the RAID project root after activating the prepared conda environment.
+# Submit from the RAID project root; this script activates the raid conda environment.
 # Pass cluster-specific --partition/--account/--qos options to sbatch, before this file.
 set -Eeuo pipefail
 trap 'status=$?; printf "%s [DEBUG] train_fsc147.sbatch failed: line=%s status=%s\n" "$(date -Is)" "$LINENO" "$status" >&2; exit "$status"' ERR
@@ -20,17 +20,20 @@ cd -- "$project_dir"
 config="${1:-configs/server.json}"
 if (( $# > 0 )); then shift; fi
 
-# sbatch does not start an interactive shell; use the submitted conda environment directly.
-if [[ -n "${RAID_PYTHON:-}" ]]; then
-    python_bin="$RAID_PYTHON"
-elif [[ -n "${CONDA_PREFIX:-}" ]]; then
-    python_bin="$CONDA_PREFIX/bin/python"
-else
-    printf '%s [DEBUG] Activate your conda environment before sbatch, or export RAID_PYTHON=/absolute/path/to/python.\n' "$(date -Is)" >&2
-    exit 2
-fi
+conda_root=/public/home/yzhang712/anaconda3
+conda_env=raid
+conda_init="$conda_root/etc/profile.d/conda.sh"
+[[ -f "$conda_init" ]] || { printf 'Conda initialization script missing: %s\n' "$conda_init" >&2; exit 2; }
+# Batch shells do not reliably inherit the environment shown in the submission prompt.
+source "$conda_init"
+conda activate "$conda_env"
+python_bin="$(command -v python)"
 
 [[ -x "$python_bin" ]] || { printf 'Python executable missing: %s\n' "$python_bin" >&2; exit 2; }
+[[ "${CONDA_DEFAULT_ENV:-}" == "$conda_env" ]] || {
+    printf 'Expected conda environment %s, got %s\n' "$conda_env" "${CONDA_DEFAULT_ENV:-<none>}" >&2
+    exit 2
+}
 [[ -f run_train_fsc147.py ]] || { printf 'RAID project root is incorrect: %s\n' "$PWD" >&2; exit 2; }
 [[ -f "$config" ]] || { printf 'Server configuration missing: %s\n' "$config" >&2; exit 2; }
 
@@ -39,8 +42,9 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 # cuda:0 means the first GPU assigned by Slurm; preserve CUDA_VISIBLE_DEVICES.
 train_args=(--config "$config" --device cuda:0 "$@")
-printf '%s [DEBUG] job=%s host=%s project=%s python=%s config=%s\n' \
-    "$(date -Is)" "$SLURM_JOB_ID" "$(hostname)" "$PWD" "$python_bin" "$config"
+printf '%s [DEBUG] job=%s host=%s project=%s conda_env=%s python=%s config=%s\n' \
+    "$(date -Is)" "$SLURM_JOB_ID" "$(hostname)" "$PWD" "$CONDA_DEFAULT_ENV" \
+    "$python_bin" "$config"
 
 "$python_bin" - "${train_args[@]}" <<'PY'
 import logging

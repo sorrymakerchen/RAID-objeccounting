@@ -6,8 +6,8 @@
 torchvision 0.18.0；本机已用此组合完成真实数据验证。
 
 ```bash
-conda create -n raid-count python=3.10 -y
-conda activate raid-count
+conda create -n raid python=3.10 -y
+conda activate raid
 python -m pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu118
 python -m pip install -r requirements-counting.txt
 ```
@@ -161,18 +161,18 @@ python tools/validate_counting.py --checkpoint outputs/overfit/latest.pt
 内存、24 小时。分区、账户及 QoS 按集群要求通过 sbatch 参数指定，不预设集群名称。
 配置示例为 `configs/server.example.json`；将其复制为 `configs/server.json` 并替换真实路径。
 
-先在服务器进入 RAID 项目根目录并激活已准备好的 conda 环境：
+服务器脚本固定加载 `/public/home/yzhang712/anaconda3/etc/profile.d/conda.sh`，并在计算
+节点执行 `conda activate raid`。从 RAID 项目根目录直接提交：
 
 ```bash
 cd /absolute/path/to/RAID
-conda activate YOUR_ENV
 sbatch --partition=YOUR_GPU_PARTITION scripts/train_fsc147.sbatch configs/server.json
 ```
 
 如集群有 GPU 默认分区，可以省略 `--partition`。如需账户，在脚本文件名前增加
 `--account=YOUR_ACCOUNT`；其他资源也可用 sbatch 参数覆盖，例如 `--time=12:00:00`。
-脚本使用提交时 conda 环境中的 Python，不依赖计算节点交互式 shell 初始化。
-也可以在提交前显式指定 `export RAID_PYTHON=/path/to/conda/envs/YOUR_ENV/bin/python`。
+脚本不使用提交终端继承的 `CONDA_PREFIX` 或 `RAID_PYTHON`。如果迁移到其他用户或
+conda 安装目录，需要同步修改两个 sbatch 脚本顶部的 `conda_root` 和 `conda_env`。
 
 脚本保留 Slurm 分配的 `CUDA_VISIBLE_DEVICES`，以 `cuda:0` 使用分配到的 GPU。
 执行前检查 CLIP 导入、CUDA、准备好的本地权重、DINOv2 仓库及完整数据训练配置。
@@ -182,10 +182,11 @@ sbatch --partition=YOUR_GPU_PARTITION scripts/train_fsc147.sbatch configs/server
 
 ```bash
 squeue -j JOB_ID
-tail -f slurm-raid-fsc147-JOB_ID.out
+tail -f log/slurm-raid-fsc147-JOB_ID.out
 ```
 
-错误输出为 `slurm-raid-fsc147-JOB_ID.err`，训练日志仍位于配置的输出目录中。
+提交前在项目根目录执行 `mkdir -p log`；Slurm 在脚本执行前打开日志文件。
+错误输出为 `log/slurm-raid-fsc147-JOB_ID.err`，训练日志仍位于配置的输出目录中。
 需要恢复时，确认先前作业已经结束，再提交：
 
 ```bash

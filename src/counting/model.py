@@ -7,6 +7,22 @@ from torch import nn
 from src.expert import Expert_layer1, Expert_layer2
 
 
+def spatial_candidate_indices(similarity, height, width):
+    if (height, width) != (32, 32) or similarity.shape[1] != height * width:
+        raise ValueError('Spatial intervention requires a 32x32 grid')
+    cells = torch.arange(height * width, device=similarity.device).reshape(height, width)
+    parts = []
+    for y in range(5):
+        for x in range(5):
+            ids = cells[y * height // 5:(y + 1) * height // 5,
+                        x * width // 5:(x + 1) * width // 5].flatten()
+            ranking = similarity[:, ids].argsort(dim=1, descending=True, stable=True)[:, :6]
+            parts.append(ids[ranking])
+    indices = torch.cat(parts, dim=1).sort(dim=1).values
+    ranking = similarity.gather(1, indices).argsort(dim=1, descending=True, stable=True)
+    return indices.gather(1, ranking)
+
+
 class TextGuidedRetrieval(nn.Module):
     def __init__(self, k=150, temperature=0.1):
         super().__init__()
@@ -14,7 +30,7 @@ class TextGuidedRetrieval(nn.Module):
             raise ValueError('Retrieval k and temperature must be positive')
         self.k, self.temperature = k, temperature
 
-    def forward(self, features, text):
+    def forward(self, features, text, spatial=False):
         b, c, h, w = features.shape
         if text.shape != (b, c) or self.k > h * w:
             raise ValueError(f'Retrieval dimensions incompatible: features={features.shape}, '
@@ -24,6 +40,10 @@ class TextGuidedRetrieval(nn.Module):
         similarity = torch.einsum('bnc,bc->bn', query, text)
         # Stable ordering makes tied scores reproducible across repeated evaluation.
         indices = similarity.argsort(dim=1, descending=True, stable=True)[:, :self.k]
+        if spatial:
+            if self.k != 150:
+                raise ValueError('Spatial intervention requires K=150')
+            indices = spatial_candidate_indices(similarity, h, w)
         candidates = query.gather(1, indices.unsqueeze(-1).expand(-1, -1, c))
         matching = query @ candidates.transpose(1, 2)
         reconstructed = (matching / self.temperature).softmax(-1) @ candidates
@@ -73,9 +93,11 @@ class CountingMoE(nn.Module):
         selected = probabilities * mask
         return selected / selected.sum(-1, keepdim=True).clamp_min(1e-8)
 
-    def forward(self, guidance, matching, epoch=0):
+    def forward(self, guidance, matching, epoch=0, return_diagnostics=False, intervention='D0'):
         probabilities = self.router1(guidance)
         weights = self.top2_weights(probabilities)
+        if intervention == 'D3':
+            weights = guidance.new_tensor([0., .5, .5]).expand(guidance.shape[0], -1)
         outputs = []
         for index, expert in enumerate(self.models1):
             # Dispatch whole selected samples; zero-weight experts must not add biases.
@@ -91,11 +113,26 @@ class CountingMoE(nn.Module):
         balance = self.experts * (usage * probabilities.mean(0)).sum()
         if epoch < self.warmup_epochs:
             weights2 = guidance.new_full((guidance.shape[0], self.experts), 1 / self.experts)
+            probabilities2 = None
         else:
             weights2 = self.router2(torch.cat([combined, matching], dim=1))
+            probabilities2 = weights2
             balance = balance + self.experts * weights2.mean(0).square().sum()
-        logits = torch.stack([expert(combined, matching)[0] for expert in self.models2], dim=1)
-        logits = (logits * weights2.unsqueeze(-1)).sum(1)
+        if intervention == 'D4':
+            weights2 = torch.full_like(weights2, 1 / self.experts)
+        expert_logits = torch.stack([expert(combined, matching)[0] for expert in self.models2], dim=1)
+        logits = (expert_logits * weights2.unsqueeze(-1)).sum(1)
+        if return_diagnostics:
+            return logits, balance, {
+                'stage1_probabilities': probabilities.detach(),
+                'stage1_weights': weights.detach(),
+                # Warmup never executes router2: do not invent a measured probability.
+                'stage2_probabilities': None if probabilities2 is None else probabilities2.detach(),
+                'stage2_weights': weights2.detach(),
+                'stage2_routing_active': probabilities2 is not None,
+                'mixed_logits': logits,
+                'stage2_expert_logits': expert_logits.detach(),
+            }
         return logits, balance
 
 
@@ -114,18 +151,28 @@ class RAIDCounter(nn.Module):
         self.encoder.eval()
         return self
 
-    def forward(self, images, texts, epoch=0):
+    def forward(self, images, texts, epoch=0, return_diagnostics=False, intervention='D0'):
+        if intervention not in ('D0', 'D1', 'D2', 'D3', 'D4'):
+            raise ValueError(f'Unknown intervention: {intervention}')
+        if intervention != 'D0' and self.training:
+            raise ValueError('Fixed-weight interventions require eval mode')
         if isinstance(texts, str) or len(texts) != len(images) or any(
                 not isinstance(t, str) or not t.strip() for t in texts):
             raise ValueError('Each image requires one non-empty text prompt')
         with torch.no_grad():
             features, text = self.encoder(images, texts)
-            retrieved = self.retrieval(features, text)
+            retrieved = self.retrieval(features, text, spatial=intervention == 'D2')
         guidance = torch.cat([self.projection(retrieved['query']),
                               self.projection(retrieved['reconstructed']),
                               retrieved['similarity']], dim=1)
-        logits, balance = self.moe(guidance, retrieved['matching'], epoch)
+        moe_output = self.moe(guidance, retrieved['matching'], epoch, return_diagnostics, intervention)
+        logits, balance = moe_output[:2]
         density = F.softplus(logits).reshape(images.shape[0], 1, *features.shape[-2:])
-        return {'density': density, 'count': density.sum((1, 2, 3)),
+        result = {'density': density, 'count': density.sum((1, 2, 3)),
                 'similarity': retrieved['similarity'], 'indices': retrieved['indices'],
                 'balance_loss': balance}
+        if return_diagnostics:
+            result['diagnostics'] = dict(moe_output[2],
+                                         grid_similarity=retrieved['similarity'].detach(),
+                                         candidate_indices=retrieved['indices'].detach())
+        return result

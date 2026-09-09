@@ -50,14 +50,16 @@ def read_json(path):
 
 class FSC147Dataset(Dataset):
     def __init__(self, root, text_annotations, split='train', image_size=448,
-                 flip_probability=None, limit=None):
+                 flip_probability=None, limit=None, density_supervision_size=None):
         self.root = Path(root)
         if split not in ('train', 'val', 'test'):
             raise ValueError(f'Unsupported FSC147 split: {split}')
         if image_size < 28 or image_size % 14:
             raise ValueError('image_size must be a multiple of 14 and at least 28')
         self.image_size = image_size
-        self.grid_size = image_size // 14
+        self.grid_size = image_size // 14 if density_supervision_size is None else density_supervision_size
+        if self.grid_size < 1:
+            raise ValueError('Density supervision size must be positive')
         self.flip_probability = (0.5 if split == 'train' else 0) if flip_probability is None else flip_probability
         if not 0 <= self.flip_probability <= 1:
             raise ValueError('flip_probability must lie in [0, 1]')

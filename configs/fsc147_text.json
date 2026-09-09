@@ -8,6 +8,8 @@
   "download_root": null,
   "device": "cuda:0",
   "image_size": 448,
+  "count_loss_mode": "relative",
+  "density_supervision_size": 32,
   "k": 150,
   "reduced_dim": 384,
   "expert_dim": 384,

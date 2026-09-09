@@ -45,6 +45,8 @@ def parse_config(mode, argv=None):
     for key in ('lr', 'weight_decay'):
         parser.add_argument('--' + key.replace('_', '-'), type=float)
     parser.add_argument('--no-augment', dest='augment', action='store_false', default=None)
+    parser.add_argument('--count-loss-mode', choices=('relative', 'absolute'))
+    parser.add_argument('--density-supervision-size', type=int)
     if mode == 'train':
         parser.add_argument('--resume')
     else:
@@ -80,6 +82,10 @@ def parse_config(mode, argv=None):
         raise ValueError('workers and weight_decay must be nonnegative; lr must be positive')
     if config['image_size'] % 14 or config['k'] > (config['image_size'] // 14) ** 2:
         raise ValueError('image_size must be divisible by 14 and provide at least k patches')
+    if config['count_loss_mode'] not in ('relative', 'absolute'):
+        raise ValueError('count_loss_mode must be relative or absolute')
+    if config['density_supervision_size'] < 1 or (config['image_size'] // 14) % config['density_supervision_size']:
+        raise ValueError('density_supervision_size must divide the native output grid')
     return config, args
 
 
@@ -98,7 +104,7 @@ def build_loader(config, split, limit=None, training=False):
     dataset = FSC147Dataset(config['data_root'], config['text_annotations'], split,
                             image_size=config['image_size'],
                             flip_probability=0.5 if training and config['augment'] else 0,
-                            limit=limit)
+                            limit=limit, density_supervision_size=config.get('density_supervision_size', 32))
     return DataLoader(dataset, batch_size=config['batch_size'], shuffle=training,
                       num_workers=config['workers'], worker_init_fn=seed_worker,
                       pin_memory=str(config['device']).startswith('cuda'), drop_last=False)
@@ -132,7 +138,8 @@ def train(config, args):
     write_json(directory / 'config.json', config)
     for epoch in range(start, config['epochs']):
         training = train_epoch(model, train_loader, optimizer, config['device'], epoch,
-                               config['accumulation'])
+                               config['accumulation'], count_loss_mode=config.get('count_loss_mode', 'relative'),
+                               density_supervision_size=config.get('density_supervision_size', 32))
         validation, _ = evaluate(model, val_loader, config['device'], epoch)
         LOGGER.info('epoch=%d train=%s val=%s', epoch, training, validation)
         record = {'epoch': epoch, 'train': training, 'val': validation}

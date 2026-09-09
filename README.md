@@ -8,6 +8,8 @@ ViT-B/14-register、CLIP 文本编码器和 Talk2DINO 投影，以文本选择�
 
 - [安装、数据准备、训练、评估、推理](docs/FSC147_COUNTING.md)
 - [默认配置](configs/fsc147_text.json)
+- [不重训诊断与 sbatch 提交](docs/FSC147_DIAGNOSIS.md)
+- [密度监督与尺度对照实验 D0–D4 / T0–T2](docs/FSC147_ABLATIONS.md)
 - [本次验证记录](docs/VALIDATION.md)
 - [第三方来源与许可](THIRD_PARTY_NOTICES.md)
 
