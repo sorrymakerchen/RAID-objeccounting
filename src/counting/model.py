@@ -168,12 +168,18 @@ class SpatialCountingHead(nn.Module):
 
 class RAIDCounter(nn.Module):
     def __init__(self, encoder, feature_dim=768, reduced_dim=384, k=150,
-                 expert_dim=384, warmup_epochs=30, head_type='raid', routing_seed=None):
+                 expert_dim=384, warmup_epochs=30, head_type='raid', routing_seed=None,
+                 retrieval_input_mode='full'):
         super().__init__()
+        if retrieval_input_mode not in ('full', 'query_text'):
+            raise ValueError(f'Unknown retrieval input mode: {retrieval_input_mode}')
+        if retrieval_input_mode != 'full' and head_type != 'spatial':
+            raise ValueError('Retrieval input ablation requires the spatial counting head')
         self.encoder = encoder.requires_grad_(False).eval()
         self.retrieval = TextGuidedRetrieval(k)
         self.projection = nn.Conv2d(feature_dim, reduced_dim, 1)
         self.head_type = head_type
+        self.retrieval_input_mode = retrieval_input_mode
         if head_type == 'raid':
             self.moe = CountingMoE(reduced_dim * 2 + 1, expert_dim, k,
                                    warmup_epochs=warmup_epochs)
@@ -201,19 +207,25 @@ class RAIDCounter(nn.Module):
         with torch.no_grad():
             features, text = self.encoder(images, texts)
             retrieved = self.retrieval(features, text, spatial=intervention == 'D2')
-        guidance = torch.cat([self.projection(retrieved['query']),
-                              self.projection(retrieved['reconstructed']),
+        projected_query = self.projection(retrieved['query'])
+        projected_reconstructed = self.projection(retrieved['reconstructed'])
+        matching = retrieved['matching']
+        if self.retrieval_input_mode == 'query_text':
+            # Keep the head shape and parameters fixed while removing only retrieval evidence.
+            projected_reconstructed = torch.zeros_like(projected_reconstructed)
+            matching = torch.zeros_like(matching)
+        guidance = torch.cat([projected_query, projected_reconstructed,
                               retrieved['similarity']], dim=1)
         if self.head_type == 'spatial':
             if intervention != 'D0':
                 raise ValueError('Spatial head does not support legacy interventions')
-            logits = self.spatial_head(guidance, retrieved['matching'])
+            logits = self.spatial_head(guidance, matching)
             detail = {key: None for key in ('stage1_probabilities', 'stage1_weights',
                                             'stage2_probabilities', 'stage2_weights')}
             detail.update(stage2_routing_active=None, mixed_logits=logits)
             moe_output = (logits, logits.new_zeros(()), detail)
         else:
-            moe_output = self.moe(guidance, retrieved['matching'], epoch, return_diagnostics, intervention)
+            moe_output = self.moe(guidance, matching, epoch, return_diagnostics, intervention)
         logits, balance = moe_output[:2]
         density = F.softplus(logits).reshape(images.shape[0], 1, *features.shape[-2:])
         result = {'density': density, 'count': density.sum((1, 2, 3)),

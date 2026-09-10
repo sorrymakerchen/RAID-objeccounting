@@ -6,5 +6,6 @@ runtime/
 weights/
 checkpoints/
 *.rar
+*.tar.gz
 log/*
 !log/.gitkeep

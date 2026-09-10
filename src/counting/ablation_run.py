@@ -291,7 +291,7 @@ def run_training(args, directory, config_factory=None, model_factory=None):
     config['output_dir'] = str(directory)
     provenance = prepared_provenance(config)
     provenance['reference_sha256'] = sha256(args.reference_csv)
-    if args.group.startswith('A'):
+    if args.group.startswith(('A', 'B')):
         root = Path(__file__).resolve().parents[2]
         for name in ('src/counting/structure_run.py', 'src/counting/cli.py',
                      'src/counting/diagnostic_run.py', 'src/counting/diagnostics.py'):
@@ -308,7 +308,7 @@ def run_training(args, directory, config_factory=None, model_factory=None):
     set_seed(config['seed'])
     model = model_factory(config)
     initial_digest = state_digest(model)
-    if args.group.startswith('A'):
+    if args.group.startswith(('A', 'B')):
         provenance['shared_projection_sha256'] = state_digest(model.projection)
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-4, weight_decay=1e-4)
     start, best = 0, float('inf')
@@ -401,11 +401,12 @@ def run_training(args, directory, config_factory=None, model_factory=None):
                total_parameters=sum(p.numel() for p in model.parameters()),
                training_seconds=sum(json.loads(line)['seconds'] for line in
                                     (directory / 'history.jsonl').read_text(encoding='utf-8').splitlines()), **timing))
-    if args.group.startswith('A'):
+    if args.group.startswith(('A', 'B')):
         (directory / 'report.md').write_text(
             f'# Structure experiment {args.group}\n\n'
             f'Validation MAE: {scoring(rows)["mae"]:.4f}; RMSE: {scoring(rows)["rmse"]:.4f}.\n'
-            f'Best epoch (zero-based): {best_epoch}. Head: {config["head_type"]}.\n'
+            f'Best epoch (zero-based): {best_epoch}. Head: {config["head_type"]}. '
+            f'Retrieval input: {config.get("retrieval_input_mode", "full")}.\n'
             'Run structure_fsc147.py summarize for controlled selection and shared-range comparisons.\n'
             'Validation only. Spatial head routing is not applicable. No SOTA or causal claim.\n', encoding='utf-8')
     else:

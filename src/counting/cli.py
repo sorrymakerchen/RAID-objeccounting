@@ -60,7 +60,8 @@ def parse_config(mode, argv=None):
         parser.add_argument('--text', required=True)
     args = vars(parser.parse_args(argv))
     defaults = read_json(DEFAULT_CONFIG)
-    defaults.update(head_type='raid', local_count_weight=0., routing_seed=None)
+    defaults.update(head_type='raid', local_count_weight=0., routing_seed=None,
+                    retrieval_input_mode='full')
     overrides = read_json(args['config']) if args['config'] else {}
     unknown = set(overrides) - set(defaults)
     if unknown:
@@ -87,6 +88,10 @@ def parse_config(mode, argv=None):
         raise ValueError('count_loss_mode must be relative or absolute')
     if config['head_type'] not in ('raid', 'spatial'):
         raise ValueError('head_type must be raid or spatial')
+    if config['retrieval_input_mode'] not in ('full', 'query_text'):
+        raise ValueError('retrieval_input_mode must be full or query_text')
+    if config['retrieval_input_mode'] != 'full' and config['head_type'] != 'spatial':
+        raise ValueError('retrieval_input_mode=query_text requires head_type=spatial')
     if config['density_supervision_size'] < 1 or (config['image_size'] // 14) % config['density_supervision_size']:
         raise ValueError('density_supervision_size must divide the native output grid')
     return config, args
@@ -102,7 +107,8 @@ def build_model(config):
     return RAIDCounter(encoder, reduced_dim=config['reduced_dim'], k=config['k'],
                        expert_dim=config['expert_dim'], warmup_epochs=config['warmup_epochs'],
                        head_type=config.get('head_type', 'raid'),
-                       routing_seed=config.get('routing_seed')).to(device)
+                       routing_seed=config.get('routing_seed'),
+                       retrieval_input_mode=config.get('retrieval_input_mode', 'full')).to(device)
 
 
 def build_loader(config, split, limit=None, training=False):

@@ -1,4 +1,4 @@
-"""Run validation-only RAID structure experiments."""
+"""Run validation-only RAID structure and retrieval-input experiments."""
 import sys
 from pathlib import Path
 

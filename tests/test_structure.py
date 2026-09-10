@@ -11,8 +11,11 @@ import torch
 from test_counting import FakeEncoder
 from src.counting.model import RAIDCounter, CountingRouter
 from src.counting.training import local_count_loss, save_checkpoint, restore_checkpoint, counting_loss
-from src.counting.structure_run import structure_config, next_experiments, check_training_gate
+from src.counting.structure_run import (structure_config, next_experiments, check_training_gate,
+                                        replication_decision, summarize_replication,
+                                        retrieval_decision, summarize_retrieval)
 from src.counting import ablation_run as run
+from src.counting.diagnostic_run import sha256, write_csv
 from test_diagnostics import SyntheticDiagnosticDataset
 
 
@@ -159,6 +162,28 @@ class StructureTests(unittest.TestCase):
             restore_checkpoint(path, model)
             torch.testing.assert_close(output['density'], model(images, ['red', 'green'])['density'])
 
+    def test_retrieval_ablation_zeros_only_retrieved_inputs(self):
+        full = RAIDCounter(FakeEncoder(), feature_dim=4, reduced_dim=4, k=10,
+                           expert_dim=4, head_type='spatial').eval()
+        reduced = RAIDCounter(FakeEncoder(), feature_dim=4, reduced_dim=4, k=10,
+                              expert_dim=4, head_type='spatial',
+                              retrieval_input_mode='query_text').eval()
+        reduced.load_state_dict(full.state_dict())
+        captured = []
+        hook = reduced.spatial_head.register_forward_pre_hook(
+            lambda module, inputs: captured.append(tuple(value.detach().clone() for value in inputs)))
+        images = torch.randn(2, 3, 16, 16)
+        baseline = full(images, ['red', 'green'], return_diagnostics=True)
+        ablated = reduced(images, ['red', 'green'], return_diagnostics=True)
+        hook.remove()
+        guidance, matching = captured[0]
+        self.assertTrue(torch.equal(matching, torch.zeros_like(matching)))
+        self.assertTrue(torch.equal(guidance[:, 4:8], torch.zeros_like(guidance[:, 4:8])))
+        self.assertFalse(torch.equal(guidance[:, :4], torch.zeros_like(guidance[:, :4])))
+        torch.testing.assert_close(baseline['similarity'], ablated['similarity'])
+        self.assertTrue(torch.equal(baseline['indices'], ablated['indices']))
+        self.assertFalse(torch.equal(baseline['density'], ablated['density']))
+
     def test_router_stream_survives_unrelated_rng_and_restore(self):
         router = CountingRouter(4, 3)
         router.set_noise_seed(123)
@@ -173,6 +198,124 @@ class StructureTests(unittest.TestCase):
     def test_definitions_and_selection(self):
         self.assertEqual(structure_config({}, 'A2')['local_count_weight'], .1)
         self.assertEqual(structure_config({}, 'A1')['head_type'], 'spatial')
+        self.assertEqual(structure_config({}, 'A1', 44)['seed'], 44)
         self.assertEqual(next_experiments({'A1': True, 'A2': True}), [('A3', 42)])
         self.assertEqual(next_experiments({'A1': False, 'A2': True}), [('A0', 43), ('A2', 43)])
         self.assertEqual(next_experiments({'A1': False, 'A2': False}), [])
+        b0, b1 = structure_config({}, 'B0'), structure_config({}, 'B1')
+        self.assertEqual([key for key in b0 if b0[key] != b1[key]], ['retrieval_input_mode'])
+
+    def test_retrieval_decision_distinguishes_useful_harmful_and_equivalent(self):
+        def rows(b0, b1):
+            result = []
+            for seed in (42, 43, 44):
+                for group, values in (('B0', b0), ('B1', b1)):
+                    result.append(dict(group=group, seed=seed, mae=values[0], rmse=values[1],
+                                       high_mae=values[2], low_mae=values[3]))
+            return result
+        useful = retrieval_decision(rows((20, 50, 100, 4), (22, 52, 110, 5)))
+        self.assertEqual(useful['conclusion'], 'retrieval_beneficial')
+        harmful = retrieval_decision(rows((22, 52, 110, 5), (20, 50, 100, 4)))
+        self.assertEqual(harmful['conclusion'], 'retrieval_harmful')
+        equivalent = retrieval_decision(rows((20, 50, 100, 4), (20.1, 50.2, 102, 4.2)))
+        self.assertEqual(equivalent['conclusion'], 'practically_equivalent')
+
+    def test_replication_requires_mean_gate_and_two_seed_wins(self):
+        rows = []
+        for seed, a0_mae, a1_mae in ((42, 30., 27.), (43, 31., 28.), (44, 29., 30.)):
+            rows += [dict(group='A0', seed=seed, mae=a0_mae, rmse=100.,
+                          high_mae=300., low_mae=6.),
+                     dict(group='A1', seed=seed, mae=a1_mae, rmse=98.,
+                          high_mae=280., low_mae=6.1)]
+        decision = replication_decision(rows)
+        self.assertEqual(decision['a1_mae_wins'], 2)
+        self.assertTrue(decision['eligible'])
+        rows[-1]['high_mae'] = 400.
+        decision = replication_decision(rows)
+        self.assertFalse(decision['eligible'])
+        self.assertFalse(decision['checks']['high_count'])
+
+    def test_replication_rejects_missing_or_duplicate_seed_pair(self):
+        rows = [dict(group='A0', seed=42, mae=1., rmse=1., high_mae=1., low_mae=1.),
+                dict(group='A1', seed=42, mae=.5, rmse=.5, high_mae=.5, low_mae=.5)] * 3
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            replication_decision(rows)
+
+    def test_replication_summary_recomputes_six_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = []
+            for seed in (42, 43, 44):
+                for group in ('A0', 'A1'):
+                    root = Path(tmp) / f'{group}_{seed}'
+                    (root / 'best_validation').mkdir(parents=True)
+                    config = structure_config({'output_dir': str(root)}, group, seed)
+                    predictions = []
+                    error = 10 if group == 'A0' else 8
+                    for index in range(1286):
+                        target = 300. if index < 73 else 10.
+                        predictions.append({'image_id': f'{index}.jpg', 'text': 'the dots',
+                                            'category': f'category-{index % 29}', 'target': target,
+                                            'prediction': target + error, 'absolute_error': error})
+                    write_csv(root / 'best_validation/predictions.csv', predictions)
+                    scores = run.scoring(predictions)
+                    (root / 'best.pt').write_bytes(f'{group}-{seed}'.encode())
+                    summary = dict(status='complete', group=group, **scores, best_epoch=50,
+                                   trainable_parameters=2 if group == 'A0' else 1,
+                                   training_seconds=1., training_peak_gpu_allocated_bytes=1,
+                                   checkpoint_sha256=sha256(root / 'best.pt'))
+                    (root / 'config.json').write_text(json.dumps(config))
+                    (root / 'summary.json').write_text(json.dumps(summary))
+                    provenance = {'initial_state_sha256': f'{group}-{seed}',
+                                  'shared_projection_sha256': f'projection-{seed}',
+                                  'files': {'weights': 'same'},
+                                  'source_sha256': {'src/counting/model.py': 'same',
+                                                    'src/counting/structure_run.py': f'wrapper-{seed}'}}
+                    (root / 'provenance.json').write_text(json.dumps(provenance))
+                    roots.append(str(root))
+            output = Path(tmp) / 'comparison'
+            output.mkdir()
+            self.assertEqual(summarize_replication(SimpleNamespace(runs=roots), output), 0)
+            result = json.loads((output / 'summary.json').read_text())
+            self.assertEqual(result['selection'], 'A1')
+            self.assertEqual(result['decision']['a1_mae_wins'], 3)
+            self.assertEqual(len((output / 'paired_predictions.csv').read_text().splitlines()), 1287)
+
+    def test_retrieval_summary_recomputes_six_runs_and_checks_initialization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = []
+            for seed in (42, 43, 44):
+                for group in ('B0', 'B1'):
+                    root = Path(tmp) / f'{group}_{seed}'
+                    (root / 'best_validation').mkdir(parents=True)
+                    config = structure_config({'output_dir': str(root)}, group, seed)
+                    error = 8 if group == 'B0' else 10
+                    predictions = []
+                    for index in range(1286):
+                        target = 300. if index < 73 else 10.
+                        predictions.append({'image_id': f'{index}.jpg', 'text': 'the dots',
+                                            'category': f'category-{index % 29}', 'target': target,
+                                            'prediction': target + error, 'absolute_error': error})
+                    write_csv(root / 'best_validation/predictions.csv', predictions)
+                    scores = run.scoring(predictions)
+                    (root / 'best.pt').write_bytes(f'{group}-{seed}'.encode())
+                    summary = dict(status='complete', group=group, **scores, best_epoch=50,
+                                   trainable_parameters=1, training_seconds=1.,
+                                   training_peak_gpu_allocated_bytes=1,
+                                   checkpoint_sha256=sha256(root / 'best.pt'))
+                    (root / 'config.json').write_text(json.dumps(config))
+                    (root / 'summary.json').write_text(json.dumps(summary))
+                    provenance = {'initial_state_sha256': f'initial-{seed}',
+                                  'shared_projection_sha256': f'projection-{seed}',
+                                  'files': {'weights': 'same'},
+                                  'source_sha256': {'src/counting/model.py': 'same',
+                                                    'src/counting/structure_run.py': 'same'}}
+                    (root / 'provenance.json').write_text(json.dumps(provenance))
+                    roots.append(str(root))
+            output = Path(tmp) / 'comparison'
+            output.mkdir()
+            self.assertEqual(summarize_retrieval(SimpleNamespace(runs=roots), output), 0)
+            result = json.loads((output / 'summary.json').read_text())
+            self.assertEqual(result['selection'], 'B0')
+            self.assertEqual(result['conclusion'], 'retrieval_beneficial')
+            self.assertFalse(result['test_set_accessed'])
+            self.assertEqual(len((output / 'paired_predictions.csv').read_text().splitlines()), 1287)
